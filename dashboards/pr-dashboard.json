@@ -1,0 +1,65 @@
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "width": 24,
+      "height": 6,
+      "properties": {
+        "view": "timeSeries",
+        "title": "Step Functions Executions and Failures",
+        "metrics": [
+          [ "AWS/States", "ExecutionsStarted", "StateMachineArn", "${StateMachineArn}", { "stat": "Sum" } ],
+          [ ".", "ExecutionsSucceeded", ".", ".", { "stat": "Sum" } ],
+          [ ".", "ExecutionsFailed", ".", ".", { "stat": "Sum" } ]
+        ],
+        "region": "${AWS::Region}",
+        "stacked": false
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "view": "timeSeries",
+        "title": "Lambda Errors (All PR Functions)",
+        "metrics": [
+          [ "AWS/Lambda", "Errors", "FunctionName", "pr-*", { "stat": "Sum" } ],
+          [ ".", "Throttles", ".", ".", { "stat": "Sum" } ]
+        ],
+        "region": "${AWS::Region}",
+        "stacked": false
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "view": "timeSeries",
+        "title": "DynamoDB Throttles",
+        "metrics": [
+          [ "AWS/DynamoDB", "WriteThrottleEvents", "TableName", "PRRuns", { "stat": "Sum" } ],
+          [ ".", "ReadThrottleEvents", ".", ".", { "stat": "Sum" } ]
+        ],
+        "region": "${AWS::Region}",
+        "stacked": false
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "view": "timeSeries",
+        "title": "SNS Delivery Failures",
+        "metrics": [
+          [ "AWS/SNS", "NumberOfNotificationsFailed", "TopicName", "pr-review-events", { "stat": "Sum" } ],
+          [ ".", "NumberOfNotificationsDelivered", ".", ".", { "stat": "Sum" } ]
+        ],
+        "region": "${AWS::Region}",
+        "stacked": false
+      }
+    }
+  ]
+}

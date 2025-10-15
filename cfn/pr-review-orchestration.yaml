@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: PR Review - Orchestration (EventBridge + Step Functions)
+Parameters:
+  BucketName:
+    Type: String
+    Default: !ImportValue pr-core:Bucket
+  TableName:
+    Type: String
+    Default: !ImportValue pr-core:Table
+  SnsArn:
+    Type: String
+    Default: !ImportValue pr-core:Sns
+  TfPlanParserFnArn:
+    Type: String
+    Default: !ImportValue pr-compute:TfPlanParserFn
+Resources:
+  StatesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: pr-states-orchestrator
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: sfn-invoke-and-data
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ 'lambda:InvokeFunction' ]
+                Resource: 'arn:aws:lambda:*:*:function:pr-*'
+              - Effect: Allow
+                Action: [ 'dynamodb:PutItem','dynamodb:UpdateItem','dynamodb:GetItem','dynamodb:Query' ]
+                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}
+              - Effect: Allow
+                Action: [ 's3:GetObject','s3:ListBucket' ]
+                Resource:
+                  - !Sub arn:aws:s3:::${BucketName}
+                  - !Sub arn:aws:s3:::${BucketName}/*
+              - Effect: Allow
+                Action: [ 'sns:Publish' ]
+                Resource: !Ref SnsArn
+
+  PRReviewStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: pr-review-orchestrator
+      RoleArn: !GetAtt StatesRole.Arn
+      DefinitionString: !Sub |
+        { 
+          "Comment": "PR Review Orchestrator",
+          "StartAt": "ParsePlan",
+          "States": {
+            "ParsePlan": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": { "FunctionName": "pr-tf-plan-parser", "Payload.$": "$" },
+              "ResultPath": "$.plan",
+              "Next": "StaticGate"
+            },
+            "StaticGate": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": { "FunctionName": "pr-iam-lint", "Payload.$": "$" },
+              "ResultPath": "$.lint",
+              "Next": "RiskScore"
+            },
+            "RiskScore": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": { "FunctionName": "pr-risk-score", "Payload.$": "$" },
+              "ResultPath": "$.risk",
+              "Next": "DriftCheck"
+            },
+            "DriftCheck": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": { "FunctionName": "pr-drift-check", "Payload.$": "$" },
+              "ResultPath": "$.drift",
+              "Next": "SynthesizeVerdict"
+            },
+            "SynthesizeVerdict": {
+              "Type": "Pass",
+              "Parameters": {
+                "verdict": "amber",
+                "confidence": 0.8
+              },
+              "ResultPath": "$.verdict",
+              "Next": "CommentPR"
+            },
+            "CommentPR": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": { "FunctionName": "pr-github-commenter", "Payload.$": "$" },
+              "ResultPath": "$.comment",
+              "Next": "NotifyTeams"
+            },
+            "NotifyTeams": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": { "FunctionName": "pr-teams-notifier", "Payload.$": "$" },
+              "ResultPath": "$.teams",
+              "End": true
+            }
+          }
+        }
+
+  EventsToSfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: pr-events-to-sfn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: start-execution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'states:StartExecution'
+                Resource: !Ref PRReviewStateMachine
+
+  PrMergedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: pr-merged
+      EventPattern:
+        source: [ "pr.merge" ]
+        detail-type: [ "pr-merged" ]
+      Targets:
+        - Arn: !Ref PRReviewStateMachine
+          Id: SFnTarget
+          RoleArn: !GetAtt EventsToSfnRole.Arn
+
+  ReviewDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: pr-review
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "view": "timeSeries",
+                "title": "Step Functions Executions and Failures",
+                "metrics": [
+                  [ "AWS/States", "ExecutionsStarted", "StateMachineArn", "${PRReviewStateMachine}", { "stat": "Sum" } ],
+                  [ ".", "ExecutionsSucceeded", ".", ".", { "stat": "Sum" } ],
+                  [ ".", "ExecutionsFailed", ".", ".", { "stat": "Sum" } ]
+                ],
+                "region": "${AWS::Region}",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "view": "timeSeries",
+                "title": "Lambda Errors (All PR Functions)",
+                "metrics": [
+                  [ "AWS/Lambda", "Errors", "FunctionName", "pr-*", { "stat": "Sum" } ],
+                  [ ".", "Throttles", ".", ".", { "stat": "Sum" } ]
+                ],
+                "region": "${AWS::Region}",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "view": "timeSeries",
+                "title": "DynamoDB Throttles",
+                "metrics": [
+                  [ "AWS/DynamoDB", "WriteThrottleEvents", "TableName", "PRRuns", { "stat": "Sum" } ],
+                  [ ".", "ReadThrottleEvents", ".", ".", { "stat": "Sum" } ]
+                ],
+                "region": "${AWS::Region}",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "view": "timeSeries",
+                "title": "SNS Delivery Failures",
+                "metrics": [
+                  [ "AWS/SNS", "NumberOfNotificationsFailed", "TopicName", "pr-review-events", { "stat": "Sum" } ],
+                  [ ".", "NumberOfNotificationsDelivered", ".", ".", { "stat": "Sum" } ]
+                ],
+                "region": "${AWS::Region}",
+                "stacked": false
+              }
+            }
+          ]
+        }
+
+Outputs:
+  PRReviewStateMachineArn:
+    Value: !Ref PRReviewStateMachine
+    Export: { Name: pr-orch:StateMachineArn }

@@ -1,0 +1,34 @@
+name: PR Merged Review
+on:
+  push:
+    branches: [ develop ]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  collect-and-dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Compute plan
+        run: |
+          git fetch origin HEAD
+          terraform -chdir=./ init -input=false
+          terraform -chdir=./ plan -out=plan.bin
+          terraform -chdir=./ show -json plan.bin > plan.json
+          echo "PLAN_KEY=$(date +%s)-${{ github.sha }}/plan.json" >> $GITHUB_ENV
+
+      - name: Configure AWS creds via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.HUB_ACCOUNT_ID }}:role/github-oidc-artifacts
+          aws-region: us-east-1
+
+      - name: Upload artifacts and emit event
+        run: |
+          aws s3 cp plan.json s3://iam-pr-review-artifacts/${{ env.PLAN_KEY }}
+          aws events put-events --entries "[{\"Source\":\"pr.merge\",\"DetailType\":\"pr-merged\",\"Detail\":\"{\\\"bucket\\\":\\\"iam-pr-review-artifacts\\\",\\\"plan_key\\\":\\\"${{ env.PLAN_KEY }}\\\",\\\"repo\\\":\\\"${{ github.repository }}\\\",\\\"sha\\\":\\\"${{ github.sha }}\\\",\\\"pr_url\\\":\\\"${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}\\\"}\"}]"

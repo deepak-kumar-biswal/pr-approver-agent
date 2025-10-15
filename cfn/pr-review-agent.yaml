@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: PR Review - Bedrock Agent + KB (Custom resource fallback)
+Parameters:
+  UseNativeAgentCFN:
+    Type: String
+    AllowedValues: [true, false]
+    Default: true
+  AgentName:
+    Type: String
+    Default: pr-review-agent
+  AgentInstruction:
+    Type: String
+    Default: "Review IAM/Terraform changes and produce structured verdicts with evidence."
+  FoundationModelId:
+    Type: String
+    # Assumption: us-east-1 available model id; update as needed
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+  AgentIdleSessionTTL:
+    Type: Number
+    Default: 300
+  KbEnabled:
+    Type: String
+    AllowedValues: [true, false]
+    Default: false
+  KbS3Bucket:
+    Type: String
+    Default: iam-pr-review-artifacts
+  KbS3Prefix:
+    Type: String
+    Default: kb/
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+  VectorStoreCollectionArn:
+    Type: String
+    Default: ''
+  VectorIndexName:
+    Type: String
+    Default: kb-index
+  VectorTextField:
+    Type: String
+    Default: text
+  VectorMetadataField:
+    Type: String
+    Default: metadata
+  VectorVectorField:
+    Type: String
+    Default: embedding
+Resources:
+  AgentExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: pr-bedrock-agent-exec
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: agent-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeTfPlanParser
+                Effect: Allow
+                Action: [ 'lambda:InvokeFunction' ]
+                Resource: !ImportValue pr-compute:TfPlanParserFn
+              - Sid: ReadKbContent
+                Effect: Allow
+                Action: [ 's3:GetObject', 's3:ListBucket' ]
+                Resource:
+                  - !Sub arn:aws:s3:::${KbS3Bucket}
+                  - !Sub arn:aws:s3:::${KbS3Bucket}/${KbS3Prefix}*
+              - Sid: UseKms
+                Effect: Allow
+                Action: [ 'kms:Decrypt', 'kms:DescribeKey' ]
+                Resource: !ImportValue pr-core:KmsArn
+
+  KBAccessRole:
+    Type: AWS::IAM::Role
+    Condition: UseNativeCFN
+    Properties:
+      RoleName: pr-bedrock-kb-access
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: kb-s3-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ 's3:GetObject', 's3:ListBucket' ]
+                Resource:
+                  - !Sub arn:aws:s3:::${KbS3Bucket}
+                  - !Sub arn:aws:s3:::${KbS3Bucket}/${KbS3Prefix}*
+              - Effect: Allow
+                Action: [ 'kms:Decrypt', 'kms:DescribeKey' ]
+                Resource: !ImportValue pr-core:KmsArn
+  # Native Bedrock Agent (when supported in region)
+  BedrockAgent:
+    Condition: UseNativeCFN
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Ref AgentName
+      Instruction: !Ref AgentInstruction
+      FoundationModel: !Ref FoundationModelId
+      IdleSessionTTLInSeconds: !Ref AgentIdleSessionTTL
+      AgentResourceRoleArn: !GetAtt AgentExecutionRole.Arn
+
+  BedrockAgentAlias:
+    Condition: UseNativeCFN
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !Ref BedrockAgent
+      AgentAliasName: default
+      Description: Default alias for PR reviewer agent
+
+  BedrockKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Condition: HasVectorCollection
+    Properties:
+      Name: pr-review-kb
+      RoleArn: !GetAtt KBAccessRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Ref EmbeddingModelId
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpenSearchServerlessConfiguration:
+          CollectionArn: !Ref VectorStoreCollectionArn
+          VectorIndexName: !Ref VectorIndexName
+          FieldMapping:
+            TextField: !Ref VectorTextField
+            MetadataField: !Ref VectorMetadataField
+            VectorField: !Ref VectorVectorField
+
+  BedrockDataSource:
+    Type: AWS::Bedrock::DataSource
+    Condition: HasVectorCollection
+    Properties:
+      KnowledgeBaseId: !Ref BedrockKnowledgeBase
+      Name: pr-review-kb-s3
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !Sub arn:aws:s3:::${KbS3Bucket}
+          InclusionPrefixes:
+            - !Ref KbS3Prefix
+      RoleArn: !GetAtt KBAccessRole.Arn
+
+  # Fallback: Lambda-backed provisioner (for unsupported regions or advanced setups)
+  AgentProvisioner:
+    Condition: UseCustomCR
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-agent-provisioner
+      Role: !ImportValue pr-compute:ToolsExecArn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              # Placeholder: implement create/update Bedrock Agent + KB via SDK, return IDs
+              return {"status":"ok","AgentId":"agent-xyz","AgentAliasId":"TSTALIAS"}
+
+  AgentConfigurator:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-agent-configurator
+      Role: !ImportValue pr-compute:ToolsExecArn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 180
+      Code:
+        ZipFile: |
+          import json
+          def handler(event, context):
+            # Placeholder association: if a KnowledgeBaseId is provided, mark Associated = True
+            kb_id = event.get("KnowledgeBaseId")
+            ds_id = event.get("DataSourceId")
+            associated = True if kb_id else False
+            # In production, call Bedrock APIs to associate KB with Agent and optionally start ingestion for the data source.
+            resp = {
+              "Configured": True,
+              "Associated": associated,
+              "KnowledgeBaseId": kb_id,
+              "DataSourceId": ds_id,
+              "ActionGroups": event.get("ActionGroups", [])
+            }
+            return {"Status": "SUCCESS", "Data": resp}
+
+  AgentSetup:
+    Type: Custom::AgentSetup
+    Properties:
+      ServiceToken: !GetAtt AgentConfigurator.Arn
+      AgentId: !If [ UseNativeCFN, !Ref BedrockAgent, 'agent-xyz' ]
+      KbEnabled: !Ref KbEnabled
+      KbS3Bucket: !Ref KbS3Bucket
+      KbS3Prefix: !Ref KbS3Prefix
+      EmbeddingModelId: !Ref EmbeddingModelId
+      ActionGroups:
+        - Name: TfPlanParser
+          LambdaArn: !ImportValue pr-compute:TfPlanParserFn
+      KnowledgeBaseId: !If [ HasVectorCollection, !Ref BedrockKnowledgeBase, !Ref AWS::NoValue ]
+      DataSourceId: !If [ HasVectorCollection, !Ref BedrockDataSource, !Ref AWS::NoValue ]
+        # Add more action groups as needed; e.g., IAM Lint, Risk Score
+
+Conditions:
+  UseNativeCFN: !Equals [!Ref UseNativeAgentCFN, 'true']
+  UseCustomCR: !Not [!Equals [!Ref UseNativeAgentCFN, 'true']]
+  HasVectorCollection: !And [ !Equals [ !Ref KbEnabled, 'true' ], !Not [ !Equals [ !Ref VectorStoreCollectionArn, '' ] ] ]
+Outputs:
+  AgentId:
+    Value: !If [ UseNativeCFN, !Ref BedrockAgent, 'agent-xyz' ]
+    Export: { Name: pr-agent:Id }
+  AgentAlias:
+    Value: !If [ UseNativeCFN, !Ref BedrockAgentAlias, 'TSTALIAS' ]
+    Export: { Name: pr-agent:Alias }
+  KnowledgeBaseId:
+    Value: !If [ HasVectorCollection, !Ref BedrockKnowledgeBase, !Ref AWS::NoValue ]
+    Condition: HasVectorCollection

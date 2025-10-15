@@ -1,0 +1,59 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: PR Review - IAM roles, OIDC, cross-account access
+Parameters:
+  ArtifactsBucket:
+    Type: String
+    Default: !ImportValue pr-core:Bucket
+  KmsArn:
+    Type: String
+    Default: !ImportValue pr-core:KmsArn
+  SnsArn:
+    Type: String
+    Default: !ImportValue pr-core:Sns
+  HubAccountId:
+    Type: String
+    Description: Hub account ID
+  GitHubOrg:
+    Type: String
+  GitHubRepo:
+    Type: String
+Resources:
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [ sts.amazonaws.com ]
+      ThumbprintList: [ 6938fd4d98bab03faadb97b34396831e3780aea1 ]
+
+  GitHubOIDCArtifactsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: github-oidc-artifacts
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Federated: !Ref GitHubOIDCProvider }
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/develop"
+      Policies:
+        - PolicyName: artifacts-and-events
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ 's3:PutObject','s3:ListBucket' ]
+                Resource:
+                  - !Sub arn:aws:s3:::${ArtifactsBucket}
+                  - !Sub arn:aws:s3:::${ArtifactsBucket}/*
+              - Effect: Allow
+                Action: 'events:PutEvents'
+                Resource: '*'
+Outputs:
+  GitHubOIDCArtifactsRoleArn:
+    Value: !GetAtt GitHubOIDCArtifactsRole.Arn
+    Export: { Name: pr-iam:GitHubOIDCRoleArn }

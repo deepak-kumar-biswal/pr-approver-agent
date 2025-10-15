@@ -1,0 +1,22 @@
+# ARCHITECTURE (ASCII)
+
+GitHub (develop merge)
+   │  OIDC → GitHubOIDCArtifactsRole
+   ▼
+GitHub Action: terraform plan → plan.json + metadata
+   │  S3 Put + EventBridge PutEvents
+   ▼
+┌───────────────────────── Hub Account ─────────────────────────┐
+│ EventBridge → Step Functions (PR-Review-Orchestrator)         │
+│  ├─ Lambda: OPA/Conftest Gate                                 │
+│  ├─ Lambda: TF Plan Parser → structured diffs                  │
+│  ├─ Lambda: IAM Lint (aws-iam-policy-validator + custom)      │
+│  ├─ Lambda: Risk Scorer                                       │
+│  ├─ Bedrock Agent (KB + Tools)                                │
+│  ├─ Lambda: Drift Check (assume CrossAccountReadOnlyRole)     │
+│  └─ Lambda: GitHub Commenter + (optional) Teams Notifier      │
+│  S3 (KMS), DynamoDB (audit), SNS                               │
+└───────────────────────────────────────────────────────────────┘
+                 │
+                 ▼
+        Spoke Accounts (read‑only via assume role)

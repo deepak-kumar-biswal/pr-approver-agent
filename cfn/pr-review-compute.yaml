@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: PR Review - Compute (Lambda tools, exec roles)
+Parameters:
+  BucketName:
+    Type: String
+    Default: !ImportValue pr-core:Bucket
+  TableName:
+    Type: String
+    Default: !ImportValue pr-core:Table
+  KmsArn:
+    Type: String
+    Default: !ImportValue pr-core:KmsArn
+  SnsArn:
+    Type: String
+    Default: !ImportValue pr-core:Sns
+  TeamsSecretArn:
+    Type: String
+    Default: ''
+  DashboardName:
+    Type: String
+    Default: pr-review
+Resources:
+  LambdaBasicPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: pr-review-lambda-logs
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+  ToolsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: pr-tools-exec
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns: [ !Ref LambdaBasicPolicy ]
+      Policies:
+        - PolicyName: data-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3
+                Effect: Allow
+                Action: [ 's3:GetObject','s3:PutObject','s3:ListBucket' ]
+                Resource:
+                  - !Sub arn:aws:s3:::${BucketName}
+                  - !Sub arn:aws:s3:::${BucketName}/*
+              - Sid: DDB
+                Effect: Allow
+                Action: [ 'dynamodb:PutItem','dynamodb:UpdateItem','dynamodb:GetItem','dynamodb:Query','dynamodb:Scan' ]
+                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}
+              - Sid: SNS
+                Effect: Allow
+                Action: [ 'sns:Publish' ]
+                Resource: !Ref SnsArn
+              - Sid: KMS
+                Effect: Allow
+                Action: [ 'kms:Encrypt','kms:Decrypt','kms:GenerateDataKey','kms:DescribeKey' ]
+                Resource: !Ref KmsArn
+              - Sid: SecretsOptional
+                Effect: Allow
+                Action: [ 'secretsmanager:GetSecretValue','secretsmanager:DescribeSecret' ]
+                Resource: !If [ HasTeams, !Ref TeamsSecretArn, !Ref AWS::NoValue ]
+
+  # Lambda functions (code must be uploaded separately or use inline ZIPs for demo)
+  TfPlanParserFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-tf-plan-parser
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json, boto3, os
+          def handler(event, context):
+              # TODO: read s3://.../plan.json and emit structured diffs
+              return {"status":"ok","message":"stub TfPlanParserFn"}
+
+  IamLintFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-iam-lint
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              # TODO: lint IAM policies and trust docs (aws-iam-policy-validator or custom rules)
+              return {"status":"ok","violations":[]}
+
+  RiskScoreFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-risk-score
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              # TODO: score for wildcards, external principals, passrole scoping, ttl/tags
+              return {"risk":"amber","drivers":["wildcard:0","external:0"]}
+
+  ImpactMapFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-impact-map
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              # TODO: map modules→accounts; summarize blast radius
+              return {"accounts":["2222..."]}
+
+  DriftCheckFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-drift-check
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              # TODO: assume CrossAccountReadOnlyRole in spokes and compare current vs plan
+              return {"drift":"none"}
+
+  GitHubCommenterFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-github-commenter
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              # TODO: post Markdown comment to GitHub PR (use GH App or token in action)
+              return {"status":"comment-posted"}
+
+  TeamsNotifierFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-teams-notifier
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              # TODO: read webhook from Secrets Manager and post Adaptive Card
+              return {"status":"teams-sent"}
+
+  QuarterlyReportFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-quarterly-report
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      Code:
+    ZipFile: |
+      import boto3, json, io, datetime, os
+      from datetime import datetime as dt
+      S3 = boto3.client('s3')
+      DDB = boto3.client('dynamodb')
+
+      def _quarter(d: datetime.date):
+        return (d.month - 1)//3 + 1
+
+      def _pdf_bytes(title, lines):
+        # Very small PDF generator (text only) – not pretty but portable.
+        # For production, switch to ReportLab. This builds a single-page PDF.
+        content = f"{title}\n\n" + "\n".join(lines)
+        # Placeholder single-page binary; replace with ReportLab for rich PDFs.
+        return content.encode('utf-8')
+
+      def handler(event, context):
+        bucket = event.get('bucket') or os.environ.get('BUCKET_NAME')
+        table = event.get('table') or os.environ.get('TABLE_NAME')
+        today = dt.utcnow().date()
+        q = _quarter(today)
+        year = today.year
+        title = f"PR Review Quarterly Report {year} Q{q}"
+        # Minimal metrics (placeholder): count items via scan (bounded)
+        items = []
+        paginator = DDB.get_paginator('scan')
+        for page in paginator.paginate(TableName=table, PaginationConfig={'MaxItems': 500}):
+          items.extend(page.get('Items', []))
+        total = len(items)
+        lines = [
+          f"Total runs (sampled): {total}",
+          "Verdict mix: TBD (wire once schema is defined)",
+          "Failures: TBD",
+          "Median time saved: TBD",
+        ]
+        pdf = _pdf_bytes(title, lines)
+        key = f"reports/{year}-Q{q}.pdf"
+        S3.put_object(Bucket=bucket, Key=key, Body=pdf, ContentType='application/pdf')
+        return {"status":"ok","report_key": key}
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          BUCKET_NAME: !Ref BucketName
+
+  QuarterlyReportRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: pr-quarterly-report
+      ScheduleExpression: 'cron(0 3 1 JAN,APR,JUL,OCT ? *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt QuarterlyReportFn.Arn
+          Id: QuarterlyReportFn
+
+  EventsInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref QuarterlyReportFn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt QuarterlyReportRule.Arn
+
+
+Conditions:
+  HasTeams: !Not [ !Equals [ !Ref TeamsSecretArn, '' ] ]
+
+Outputs:
+  ToolsExecutionRoleArn:
+    Value: !GetAtt ToolsExecutionRole.Arn
+    Export: { Name: pr-compute:ToolsExecArn }
+  TfPlanParserFnArn:
+    Value: !GetAtt TfPlanParserFn.Arn
+    Export: { Name: pr-compute:TfPlanParserFn }
+  QuarterlyReportFnArn:
+    Value: !GetAtt QuarterlyReportFn.Arn
+    Export: { Name: pr-compute:QuarterlyReportFn }

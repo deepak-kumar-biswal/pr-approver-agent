@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: PR Review - Core (KMS, S3, DDB, SNS, Teams secret)
+Parameters:
+  ArtifactsBucketName:
+    Type: String
+    Default: iam-pr-review-artifacts
+  DataKeyAlias:
+    Type: String
+    Default: alias/pr-review-kms
+  CreateTeamsIntegration:
+    Type: String
+    AllowedValues: [true, false]
+    Default: false
+Resources:
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: PR Review CMK
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Root
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+  KmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Ref DataKeyAlias
+      TargetKeyId: !Ref KmsKey
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ArtifactsBucketName
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  RunsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: PRRuns
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: { SSEEnabled: true, KMSMasterKeyId: !Ref KmsKey }
+      AttributeDefinitions:
+        - AttributeName: run_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: run_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: created_at_gsi
+          KeySchema:
+            - AttributeName: created_at
+              KeyType: HASH
+          Projection: { ProjectionType: ALL }
+
+  ReviewTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: pr-review-events
+      KmsMasterKeyId: !Ref KmsKey
+
+  TeamsWebhookSecret:
+    Condition: UseTeams
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: teams/webhook
+      KmsKeyId: !Ref KmsKey
+      Description: Optional Teams incoming webhook URL
+
+Conditions:
+  UseTeams: !Equals [!Ref CreateTeamsIntegration, 'true']
+
+Outputs:
+  BucketName:
+    Value: !Ref ArtifactsBucket
+    Export: { Name: pr-core:Bucket }
+  TableName:
+    Value: !Ref RunsTable
+    Export: { Name: pr-core:Table }
+  KmsKeyArn:
+    Value: !GetAtt KmsKey.Arn
+    Export: { Name: pr-core:KmsArn }
+  SnsTopicArn:
+    Value: !Ref ReviewTopic
+    Export: { Name: pr-core:Sns }
+  TeamsSecretArn:
+    Condition: UseTeams
+    Value: !Ref TeamsWebhookSecret
+    Export: { Name: pr-core:TeamsSecret }

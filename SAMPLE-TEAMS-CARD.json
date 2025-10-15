@@ -1,0 +1,42 @@
+{
+  "type": "message",
+  "attachments": [
+    {
+      "contentType": "application/vnd.microsoft.card.adaptive",
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.5",
+        "body": [
+          {
+            "type": "TextBlock",
+            "size": "Large",
+            "weight": "Bolder",
+            "text": "PR Review: AMBER (0.82)"
+          },
+          {
+            "type": "TextBlock",
+            "text": "Repo infra/iam \u2022 2 roles \u2022 1 policy update"
+          },
+          {
+            "type": "TextBlock",
+            "wrap": true,
+            "text": "Findings:\\n\u2022 External principal without ExternalId\\n\u2022 iam:* wildcard\\n\u2022 Missing TTL tag"
+          }
+        ],
+        "actions": [
+          {
+            "type": "Action.OpenUrl",
+            "title": "Open PR",
+            "url": "<PR_URL>"
+          },
+          {
+            "type": "Action.OpenUrl",
+            "title": "Artifacts",
+            "url": "<S3_SIGNED_URL>"
+          }
+        ]
+      }
+    }
+  ]
+}
