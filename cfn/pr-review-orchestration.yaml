@@ -49,64 +49,217 @@ Resources:
     Properties:
       StateMachineName: pr-review-orchestrator
       RoleArn: !GetAtt StatesRole.Arn
-      DefinitionString: !Sub |
-        { 
-          "Comment": "PR Review Orchestrator",
-          "StartAt": "ParsePlan",
-          "States": {
-            "ParsePlan": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": { "FunctionName": "pr-tf-plan-parser", "Payload.$": "$" },
-              "ResultPath": "$.plan",
-              "Next": "StaticGate"
-            },
-            "StaticGate": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": { "FunctionName": "pr-iam-lint", "Payload.$": "$" },
-              "ResultPath": "$.lint",
-              "Next": "RiskScore"
-            },
-            "RiskScore": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": { "FunctionName": "pr-risk-score", "Payload.$": "$" },
-              "ResultPath": "$.risk",
-              "Next": "DriftCheck"
-            },
-            "DriftCheck": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": { "FunctionName": "pr-drift-check", "Payload.$": "$" },
-              "ResultPath": "$.drift",
-              "Next": "SynthesizeVerdict"
-            },
-            "SynthesizeVerdict": {
-              "Type": "Pass",
-              "Parameters": {
-                "verdict": "amber",
-                "confidence": 0.8
-              },
-              "ResultPath": "$.verdict",
-              "Next": "CommentPR"
-            },
-            "CommentPR": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": { "FunctionName": "pr-github-commenter", "Payload.$": "$" },
-              "ResultPath": "$.comment",
-              "Next": "NotifyTeams"
-            },
-            "NotifyTeams": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": { "FunctionName": "pr-teams-notifier", "Payload.$": "$" },
-              "ResultPath": "$.teams",
-              "End": true
+      DefinitionString:
+        !Sub
+          - |
+            {
+              "Comment": "PR Review Orchestrator",
+              "StartAt": "ParsePlan",
+              "States": {
+                "ParsePlan": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": { "FunctionName": "${TfPlanParserFn}", "Payload.$": "$" },
+                  "ResultPath": "$.plan",
+                  "Next": "LoadMode"
+                },
+                "LoadMode": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": { "FunctionName": "${ConfigModeFn}", "Payload.$": "$" },
+                  "ResultPath": "$.mode",
+                  "Next": "BundleGuard"
+                },
+                "BundleGuard": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": { "FunctionName": "${BundleGuardFn}", "Payload.$": "$" },
+                  "ResultPath": "$.bundle",
+                  "Next": "BundleApproved?"
+                },
+                "BundleApproved?": {
+                  "Type": "Choice",
+                  "Choices": [
+                    { "Variable": "$.bundle.Payload.approved", "BooleanEquals": true, "Next": "OPAGate" }
+                  ],
+                  "Default": "BundleBlock"
+                },
+                "BundleBlock": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${GitHubCommenterFn}",
+                    "Payload": {
+                      "repo.$": "$.repo",
+                      "sha.$": "$.sha",
+                      "pr_number.$": "$.pr_number",
+                      "markdown": "❌ Bundle not approved. Governance requires approval for rules/prompts changes."
+                    }
+                  },
+                  "ResultPath": "$.bundle_block",
+                  "Next": "NotifyTeams"
+                },
+                "OPAGate": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": { "FunctionName": "${OpaGateFn}", "Payload.$": "$" },
+                  "ResultPath": "$.opa",
+                  "Next": "OPADecide"
+                },
+                "OPADecide": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Or": [
+                        { "Variable": "$.opa.Payload.allow", "BooleanEquals": false },
+                        { "Variable": "$.opa.Payload.deny", "IsPresent": true }
+                      ],
+                      "Next": "OPAVerdictBlock"
+                    }
+                  ],
+                  "Default": "StaticGate"
+                },
+                "OPAVerdictBlock": {
+                  "Type": "Pass",
+                  "Parameters": {
+                    "verdict": "red",
+                    "confidence": 0.9,
+                    "drivers.$": "$.opa.Payload.deny"
+                  },
+                  "ResultPath": "$.verdict",
+                  "Next": "CommentPR"
+                },
+                "StaticGate": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": { "FunctionName": "${IamLintFn}", "Payload.$": "$" },
+                  "ResultPath": "$.lint",
+                  "Next": "RiskScore"
+                },
+                "RiskScore": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": { "FunctionName": "${RiskScoreFn}", "Payload.$": "$" },
+                  "ResultPath": "$.risk",
+                  "Next": "DriftCheck"
+                },
+                "DriftCheck": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": { "FunctionName": "${DriftCheckFn}", "Payload.$": "$" },
+                  "ResultPath": "$.drift",
+                  "Next": "AgentReview"
+                },
+                "AgentReview": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": { "FunctionName": "${AgentInvokerFn}", "Payload.$": "$" },
+                  "ResultPath": "$.verdict",
+                  "Retry": [
+                    {
+                      "ErrorEquals": ["States.TaskFailed", "Bedrock.ThrottlingException", "Bedrock.InternalServerException"],
+                      "IntervalSeconds": 2,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2.0
+                    }
+                  ],
+                  "Catch": [
+                    { "ErrorEquals": ["States.ALL"], "Next": "StaticVerdictFallback" }
+                  ],
+                  "Next": "PostChecks"
+                },
+                "StaticVerdictFallback": {
+                  "Type": "Pass",
+                  "Parameters": {
+                    "verdict.$": "$.risk.risk",
+                    "confidence.$": "$.risk.confidence"
+                  },
+                  "ResultPath": "$.verdict",
+                  "Next": "PostChecks"
+                },
+                "PostChecks": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": { "FunctionName": "${GitHubChecksFn}", "Payload.$": "$" },
+                  "ResultPath": "$.check",
+                  "Next": "ApprovalDecide"
+                },
+                "ApprovalDecide": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "And": [
+                        { "Variable": "$.verdict.Payload.verdict", "StringEquals": "green" },
+                        { "Variable": "$.verdict.Payload.confidence", "NumericGreaterThanEquals": 0.9 },
+                        { "Variable": "$.drift.Payload.drift", "StringEquals": "none" },
+                        { "Or": [
+                          { "Variable": "$.mode.Payload.mode", "StringEquals": "suggest_approve" },
+                          { "Variable": "$.mode.Payload.mode", "StringEquals": "auto_approve" }
+                        ]}
+                      ],
+                      "Next": "ModeBranch"
+                    }
+                  ],
+                  "Default": "CommentPR"
+                },
+                "ModeBranch": {
+                  "Type": "Choice",
+                  "Choices": [
+                    { "Variable": "$.mode.Payload.mode", "StringEquals": "auto_approve", "Next": "AutoMerge" }
+                  ],
+                  "Default": "SuggestApprove"
+                },
+                "AutoMerge": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": { "FunctionName": "${GitHubMergeFn}", "Payload.$": "$" },
+                  "ResultPath": "$.merge",
+                  "Next": "CommentPR"
+                },
+                "SuggestApprove": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${GitHubCommenterFn}",
+                    "Payload": {
+                      "repo.$": "$.repo",
+                      "sha.$": "$.sha",
+                      "pr_number.$": "$.pr_number",
+                      "markdown": "✅ Suggested approve: All gates passed with high confidence."
+                    }
+                  },
+                  "ResultPath": "$.suggest",
+                  "Next": "CommentPR"
+                },
+                "CommentPR": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": { "FunctionName": "${GitHubCommenterFn}", "Payload.$": "$" },
+                  "ResultPath": "$.comment",
+                  "Next": "NotifyTeams"
+                },
+                "NotifyTeams": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": { "FunctionName": "${TeamsNotifierFn}", "Payload.$": "$" },
+                  "ResultPath": "$.teams",
+                  "End": true
+                }
+              }
             }
-          }
-        }
+          -
+            TfPlanParserFn: !ImportValue pr-compute:TfPlanParserFn
+            IamLintFn: !ImportValue pr-compute:IamLintFn
+            RiskScoreFn: !ImportValue pr-compute:RiskScoreFn
+            DriftCheckFn: !ImportValue pr-compute:DriftCheckFn
+            AgentInvokerFn: !ImportValue pr-compute:AgentInvokerFn
+            GitHubCommenterFn: !ImportValue pr-compute:GitHubCommenterFn
+            GitHubChecksFn: !ImportValue pr-compute:GitHubChecksFn
+            OpaGateFn: !ImportValue pr-compute:OpaGateFn
+            TeamsNotifierFn: !ImportValue pr-compute:TeamsNotifierFn
+            BundleGuardFn: !ImportValue pr-compute:BundleGuardFn
+            ConfigModeFn: !ImportValue pr-compute:ConfigModeFn
+            GitHubMergeFn: !ImportValue pr-compute:GitHubMergeFn
 
   EventsToSfnRole:
     Type: AWS::IAM::Role
@@ -174,6 +327,38 @@ Resources:
                   [ ".", "Throttles", ".", ".", { "stat": "Sum" } ]
                 ],
                 "region": "${AWS::Region}",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "view": "timeSeries",
+                "title": "Verdict Counts",
+                "metrics": [
+                  [ "PRReview", "VerdictCount", "Verdict", "GREEN", { "stat": "Sum" } ],
+                  [ ".", "VerdictCount", ".", "AMBER", { "stat": "Sum" } ],
+                  [ ".", "VerdictCount", ".", "RED", { "stat": "Sum" } ]
+                ],
+                "region": "${AWS::Region}",
+                "stacked": true
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "view": "timeSeries",
+                "title": "Review Time (p50/p90)",
+                "metrics": [
+                  [ "PRReview", "ReviewTimeMs", { "stat": "p50" } ],
+                  [ ".", "ReviewTimeMs", { "stat": "p90" } ]
+                ],
+                "region": "${AWS::Region}",
+                "yAxis": { "left": { "label": "ms" } },
                 "stacked": false
               }
             },

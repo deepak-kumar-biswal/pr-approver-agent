@@ -1,4 +1,5 @@
 from typing import Dict, Any, List
+from lambdas._log import log
 
 def _unique(seq: List[str]) -> List[str]:
     return sorted({str(x) for x in seq if x})
@@ -29,4 +30,6 @@ def handler(event, context):
     else:
         radius = "large"
 
-    return {"accounts": accounts, "modules": modules, "blast_radius": radius}
+    out = {"accounts": accounts, "modules": modules, "blast_radius": radius}
+    log("INFO", "impact_map computed", event, accounts=len(accounts), modules=len(modules), radius=radius)
+    return out

@@ -1,3 +1,6 @@
+from lambdas._log import log
+
+
 def handler(event, context):
     """Compute risk category from signals.
 
@@ -46,4 +49,6 @@ def handler(event, context):
         risk = "red"
         confidence = 0.5
 
-    return {"risk": risk, "confidence": confidence, "drivers": drivers}
+    out = {"risk": risk, "confidence": confidence, "drivers": drivers}
+    log("INFO", "risk scored", event, risk=risk, confidence=confidence, drivers=len(drivers))
+    return out

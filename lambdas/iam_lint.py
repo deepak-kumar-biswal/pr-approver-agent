@@ -1,4 +1,5 @@
 import json
+from lambdas._log import log
 
 REQUIRED_TAGS = {"Owner", "CostCenter"}
 
@@ -61,6 +62,7 @@ def handler(event, context):
     """Run IAM policy lint rules and trust checks.
     Expect event to contain keys: policy (dict), trust (dict), metadata (optional)
     """
+    log("INFO", "iam_lint start", event)
     policy = event.get("policy", {})
     trust = event.get("trust", {})
     metadata = event.get("metadata", {})
@@ -69,4 +71,6 @@ def handler(event, context):
     violations += lint_policy(policy)
     violations += lint_trust(trust)
     warnings += lint_metadata(metadata)
-    return {"violations": violations, "warnings": warnings, "valid": len(violations) == 0}
+    out = {"violations": violations, "warnings": warnings, "valid": len(violations) == 0}
+    log("INFO", "iam_lint done", event, violations=len(violations), warnings=len(warnings))
+    return out

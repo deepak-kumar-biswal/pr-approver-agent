@@ -1,0 +1,116 @@
+name: Package & Deploy Compute
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws-region:
+        description: AWS region
+        required: false
+        default: us-east-1
+      artifacts-bucket:
+        description: S3 bucket for Lambda code (use core stack bucket)
+        required: true
+      code-prefix:
+        description: Prefix inside the bucket for Lambda zips
+        required: false
+        default: lambda/
+  push:
+    branches: [ main ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  package-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Package Lambda functions (zip per file)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/lambda
+          # Download OPA CLI static binary for Linux
+          curl -sL -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          chmod +x opa
+          # Build WASM bundle for policies/iam.rego (entrypoint: iam.rules)
+          mkdir -p dist/stage-opa/policies
+          ./opa build -t wasm -e iam.rules -o dist/stage-opa/policies/policy.wasm policies/iam.rego
+          echo '{}' > dist/stage-opa/policies/data.json
+          # Package lambdas
+          pushd lambdas
+          for f in agent_invoker.py drift_check.py github_checks.py github_commenter.py iam_lint.py impact_map.py quarterly_report.py risk_score.py teams_notifier.py tf_plan_parser.py config_mode.py bundle_guard.py; do
+            base="${f%.py}"
+            zip -q -j "../dist/lambda/${base}.zip" "$f" "_log.py"
+          done
+          # Package opa_gate with OPA binary and WASM artifacts
+          mkdir -p ../dist/stage-opa
+          cp opa_gate.py _log.py ../dist/stage-opa/
+          cp ../opa ../dist/stage-opa/
+          pushd ../dist/stage-opa
+          zip -q -r ../lambda/opa_gate.zip .
+          popd
+          # Package GitHub App token and merge helpers with dependencies
+          mkdir -p ../dist/stage-ghapp
+          python -m pip install --upgrade pip >/dev/null 2>&1 || true
+          python -m pip install --target ../dist/stage-ghapp PyJWT cryptography >/dev/null 2>&1
+          cp github_app_token.py github_merge.py _log.py ../dist/stage-ghapp/
+          pushd ../dist/stage-ghapp
+          zip -q -r ../lambda/github_app_token.zip .
+          zip -q -r ../lambda/github_merge.zip .
+          popd
+          # Package quarterly_report with ReportLab dependency
+          mkdir -p ../dist/stage-report
+          python -m pip install --target ../dist/stage-report reportlab >/dev/null 2>&1 || true
+          cp quarterly_report.py _log.py ../dist/stage-report/
+          pushd ../dist/stage-report
+          zip -q -r ../lambda/quarterly_report.zip .
+          popd
+          popd
+          ls -l dist/lambda
+
+      - name: Configure AWS creds via OIDC (Artifacts role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.HUB_ACCOUNT_ID }}:role/github-oidc-artifacts
+          aws-region: ${{ inputs.aws-region || 'us-east-1' }}
+
+      - name: Upload Lambda zips to S3
+        env:
+          ARTIFACTS_BUCKET: ${{ inputs.artifacts-bucket }}
+          CODE_PREFIX: ${{ inputs.code-prefix || 'lambda/' }}
+        run: |
+          aws s3 cp dist/lambda/ "s3://${ARTIFACTS_BUCKET}/${CODE_PREFIX}" --recursive --only-show-errors
+
+  deploy-compute:
+    runs-on: ubuntu-latest
+    needs: package-upload
+    if: ${{ secrets.CFN_DEPLOY_ROLE_ARN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS creds for CloudFormation deploy
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CFN_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region || 'us-east-1' }}
+
+      - name: Deploy compute stack (creates ChangeSet under the hood)
+        env:
+          ARTIFACTS_BUCKET: ${{ inputs.artifacts-bucket }}
+          CODE_PREFIX: ${{ inputs.code-prefix || 'lambda/' }}
+        run: |
+          BUNDLE_HASH=$(python tools/bundle_hash.py)
+          echo "Using bundle hash: $BUNDLE_HASH"
+          aws cloudformation deploy \
+            --stack-name pr-review-compute \
+            --template-file cfn/pr-review-compute.yaml \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides BucketName=${ARTIFACTS_BUCKET} CodeS3Prefix=${CODE_PREFIX} BundleHash=${BUNDLE_HASH}

@@ -2,6 +2,7 @@ import json
 import os
 import boto3
 from typing import Any, Dict, List, Tuple, Set
+from lambdas._log import log
 
 IAM_TYPES = {
     "aws_iam_role",
@@ -129,20 +130,32 @@ def _parse_changes(plan: Dict[str, Any]) -> Dict[str, Any]:
         "accounts": sorted(accounts_from_tags),
     }
 
+def summary_from_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Public helper for tests/tools: return summary from a plan dict."""
+    try:
+        return _parse_changes(plan or {})
+    except Exception:
+        return {"total_resources": 0, "iam": {"by_type": {}, "roles_affected": [], "wildcard_actions": []}, "modules": [], "accounts": []}
+
 def handler(event, context):
     """Read plan.json from S3 and emit a compact diff structure."""
+    log("INFO", "tf_plan_parser start", event)
     s3 = boto3.client('s3')
     bucket = event.get('bucket')
     key = event.get('plan_key')  # e.g., <run-id>/plan.json
     if not bucket or not key:
+        log("ERROR", "missing required inputs", event, missing=[k for k in ["bucket","plan_key"] if not event.get(k)])
         return {"error":"missing bucket/plan_key"}
     try:
         body = s3.get_object(Bucket=bucket, Key=key)['Body'].read()
     except Exception as e:
+        log("ERROR", "s3 get failed", event, error=str(e), bucket=bucket, key=key)
         return {"error": f"s3-get-failed: {e}"}
     try:
         plan = json.loads(body)
     except Exception as e:
+        log("ERROR", "invalid plan json", event, error=str(e))
         return {"error": f"invalid-plan-json: {e}"}
     summary = _parse_changes(plan)
+    log("INFO", "tf_plan_parser done", event, total=summary.get("total_resources"))
     return {"status": "ok", "summary": summary}

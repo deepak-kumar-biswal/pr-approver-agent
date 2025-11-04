@@ -210,6 +210,14 @@ Resources:
       ActionGroups:
         - Name: TfPlanParser
           LambdaArn: !ImportValue pr-compute:TfPlanParserFn
+        - Name: IamLint
+          LambdaArn: !ImportValue pr-compute:IamLintFn
+        - Name: RiskScore
+          LambdaArn: !ImportValue pr-compute:RiskScoreFn
+        - Name: DriftCheck
+          LambdaArn: !ImportValue pr-compute:DriftCheckFn
+        - Name: ImpactMap
+          LambdaArn: !ImportValue pr-compute:ImpactMapFn
       KnowledgeBaseId: !If [ HasVectorCollection, !Ref BedrockKnowledgeBase, !Ref AWS::NoValue ]
       DataSourceId: !If [ HasVectorCollection, !Ref BedrockDataSource, !Ref AWS::NoValue ]
         # Add more action groups as needed; e.g., IAM Lint, Risk Score

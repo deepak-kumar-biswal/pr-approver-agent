@@ -4,6 +4,9 @@ Parameters:
   BucketName:
     Type: String
     Default: !ImportValue pr-core:Bucket
+  ArtifactsPrefix:
+    Type: String
+    Default: ''
   TableName:
     Type: String
     Default: !ImportValue pr-core:Table
@@ -16,10 +19,39 @@ Parameters:
   TeamsSecretArn:
     Type: String
     Default: ''
+  GitHubAppSecretArn:
+    Type: String
+    Default: ''
+  BundleHash:
+    Type: String
+    Default: ''
   DashboardName:
     Type: String
     Default: pr-review
+  CodeS3Prefix:
+    Type: String
+    Default: lambda/
 Resources:
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: pr-lambda-dlq
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  LambdaDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [ !Ref LambdaDLQ ]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt LambdaDLQ.Arn
+            Condition:
+              ArnLike:
+                AWS:SourceArn: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:pr-*'
   LambdaBasicPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
@@ -33,6 +65,44 @@ Resources:
               - logs:CreateLogStream
               - logs:PutLogEvents
             Resource: '*'
+  PrPermissionsBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: pr-permissions-boundary
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [ 'logs:CreateLogGroup','logs:CreateLogStream','logs:PutLogEvents' ]
+            Resource: '*'
+          - Effect: Allow
+            Action: [ 's3:GetObject','s3:PutObject','s3:ListBucket' ]
+            Resource:
+              - !Sub arn:aws:s3:::${BucketName}
+              - !If
+                - HasArtifactsPrefix
+                - !Sub arn:aws:s3:::${BucketName}/${ArtifactsPrefix}*
+                - !Sub arn:aws:s3:::${BucketName}/*
+          - Effect: Allow
+            Action: [ 'dynamodb:PutItem','dynamodb:UpdateItem','dynamodb:GetItem','dynamodb:Query','dynamodb:Scan' ]
+            Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}
+          - Effect: Allow
+            Action: [ 'sns:Publish' ]
+            Resource: !Ref SnsArn
+          - Effect: Allow
+            Action: [ 'kms:Encrypt','kms:Decrypt','kms:GenerateDataKey','kms:DescribeKey' ]
+            Resource: !Ref KmsArn
+          - Effect: Allow
+            Action: [ 'secretsmanager:GetSecretValue','secretsmanager:DescribeSecret' ]
+            Resource:
+              - !If [ HasTeams, !Ref TeamsSecretArn, !Ref AWS::NoValue ]
+              - !If [ HasGitHubApp, !Ref GitHubAppSecretArn, !Ref AWS::NoValue ]
+          - Effect: Allow
+            Action: [ 'ssm:GetParameter' ]
+            Resource: '*'
+          - Effect: Allow
+            Action: [ 'bedrock:InvokeAgent' ]
+            Resource: '*'
   ToolsExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -44,6 +114,7 @@ Resources:
             Principal: { Service: lambda.amazonaws.com }
             Action: 'sts:AssumeRole'
       ManagedPolicyArns: [ !Ref LambdaBasicPolicy ]
+      PermissionsBoundary: !Ref PrPermissionsBoundary
       Policies:
         - PolicyName: data-access
           PolicyDocument:
@@ -54,7 +125,10 @@ Resources:
                 Action: [ 's3:GetObject','s3:PutObject','s3:ListBucket' ]
                 Resource:
                   - !Sub arn:aws:s3:::${BucketName}
-                  - !Sub arn:aws:s3:::${BucketName}/*
+                  - !If
+                    - HasArtifactsPrefix
+                    - !Sub arn:aws:s3:::${BucketName}/${ArtifactsPrefix}*
+                    - !Sub arn:aws:s3:::${BucketName}/*
               - Sid: DDB
                 Effect: Allow
                 Action: [ 'dynamodb:PutItem','dynamodb:UpdateItem','dynamodb:GetItem','dynamodb:Query','dynamodb:Scan' ]
@@ -71,6 +145,30 @@ Resources:
                 Effect: Allow
                 Action: [ 'secretsmanager:GetSecretValue','secretsmanager:DescribeSecret' ]
                 Resource: !If [ HasTeams, !Ref TeamsSecretArn, !Ref AWS::NoValue ]
+              - Sid: GitHubAppSecretOptional
+                Effect: Allow
+                Action: [ 'secretsmanager:GetSecretValue','secretsmanager:DescribeSecret' ]
+                Resource: !If [ HasGitHubApp, !Ref GitHubAppSecretArn, !Ref AWS::NoValue ]
+              - Sid: SSMRead
+                Effect: Allow
+                Action: [ 'ssm:GetParameter' ]
+                Resource: '*'
+              - Sid: BedrockRuntime
+                Effect: Allow
+                Action: [ 'bedrock:InvokeAgent' ]
+                Resource: '*'
+              - Sid: BedrockControlPlaneOptional
+                Effect: Allow
+                Action:
+                  - 'bedrock:CreateAgentActionGroup'
+                  - 'bedrock:UpdateAgentActionGroup'
+                  - 'bedrock:AssociateAgentKnowledgeBase'
+                  - 'bedrock:DisassociateAgentKnowledgeBase'
+                  - 'bedrock:ListAgentActionGroups'
+                  - 'bedrock:GetAgent'
+                  - 'bedrock:UpdateAgent'
+                  - 'bedrock:PrepareAgent'
+                Resource: '*'
 
   # Lambda functions (code must be uploaded separately or use inline ZIPs for demo)
   TfPlanParserFn:
@@ -79,14 +177,13 @@ Resources:
       FunctionName: pr-tf-plan-parser
       Role: !GetAtt ToolsExecutionRole.Arn
       Runtime: python3.12
-      Handler: index.handler
+      Handler: tf_plan_parser.handler
       Timeout: 60
       Code:
-        ZipFile: |
-          import json, boto3, os
-          def handler(event, context):
-              # TODO: read s3://.../plan.json and emit structured diffs
-              return {"status":"ok","message":"stub TfPlanParserFn"}
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}tf_plan_parser.zip
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
 
   IamLintFn:
     Type: AWS::Lambda::Function
@@ -94,13 +191,13 @@ Resources:
       FunctionName: pr-iam-lint
       Role: !GetAtt ToolsExecutionRole.Arn
       Runtime: python3.12
-      Handler: index.handler
+      Handler: iam_lint.handler
       Timeout: 60
       Code:
-        ZipFile: |
-          def handler(event, context):
-              # TODO: lint IAM policies and trust docs (aws-iam-policy-validator or custom rules)
-              return {"status":"ok","violations":[]}
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}iam_lint.zip
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
 
   RiskScoreFn:
     Type: AWS::Lambda::Function
@@ -108,13 +205,13 @@ Resources:
       FunctionName: pr-risk-score
       Role: !GetAtt ToolsExecutionRole.Arn
       Runtime: python3.12
-      Handler: index.handler
+      Handler: risk_score.handler
       Timeout: 60
       Code:
-        ZipFile: |
-          def handler(event, context):
-              # TODO: score for wildcards, external principals, passrole scoping, ttl/tags
-              return {"risk":"amber","drivers":["wildcard:0","external:0"]}
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}risk_score.zip
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
 
   ImpactMapFn:
     Type: AWS::Lambda::Function
@@ -122,13 +219,13 @@ Resources:
       FunctionName: pr-impact-map
       Role: !GetAtt ToolsExecutionRole.Arn
       Runtime: python3.12
-      Handler: index.handler
+      Handler: impact_map.handler
       Timeout: 60
       Code:
-        ZipFile: |
-          def handler(event, context):
-              # TODO: map modules→accounts; summarize blast radius
-              return {"accounts":["2222..."]}
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}impact_map.zip
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
 
   DriftCheckFn:
     Type: AWS::Lambda::Function
@@ -136,13 +233,13 @@ Resources:
       FunctionName: pr-drift-check
       Role: !GetAtt ToolsExecutionRole.Arn
       Runtime: python3.12
-      Handler: index.handler
+      Handler: drift_check.handler
       Timeout: 120
       Code:
-        ZipFile: |
-          def handler(event, context):
-              # TODO: assume CrossAccountReadOnlyRole in spokes and compare current vs plan
-              return {"drift":"none"}
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}drift_check.zip
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
 
   GitHubCommenterFn:
     Type: AWS::Lambda::Function
@@ -150,13 +247,13 @@ Resources:
       FunctionName: pr-github-commenter
       Role: !GetAtt ToolsExecutionRole.Arn
       Runtime: python3.12
-      Handler: index.handler
+      Handler: github_commenter.handler
       Timeout: 30
       Code:
-        ZipFile: |
-          def handler(event, context):
-              # TODO: post Markdown comment to GitHub PR (use GH App or token in action)
-              return {"status":"comment-posted"}
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}github_commenter.zip
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
 
   TeamsNotifierFn:
     Type: AWS::Lambda::Function
@@ -164,13 +261,13 @@ Resources:
       FunctionName: pr-teams-notifier
       Role: !GetAtt ToolsExecutionRole.Arn
       Runtime: python3.12
-      Handler: index.handler
+      Handler: teams_notifier.handler
       Timeout: 30
       Code:
-        ZipFile: |
-          def handler(event, context):
-              # TODO: read webhook from Secrets Manager and post Adaptive Card
-              return {"status":"teams-sent"}
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}teams_notifier.zip
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
 
   QuarterlyReportFn:
     Type: AWS::Lambda::Function
@@ -178,52 +275,137 @@ Resources:
       FunctionName: pr-quarterly-report
       Role: !GetAtt ToolsExecutionRole.Arn
       Runtime: python3.12
-      Handler: index.handler
+      Handler: quarterly_report.handler
       Timeout: 120
       Code:
-    ZipFile: |
-      import boto3, json, io, datetime, os
-      from datetime import datetime as dt
-      S3 = boto3.client('s3')
-      DDB = boto3.client('dynamodb')
-
-      def _quarter(d: datetime.date):
-        return (d.month - 1)//3 + 1
-
-      def _pdf_bytes(title, lines):
-        # Very small PDF generator (text only) – not pretty but portable.
-        # For production, switch to ReportLab. This builds a single-page PDF.
-        content = f"{title}\n\n" + "\n".join(lines)
-        # Placeholder single-page binary; replace with ReportLab for rich PDFs.
-        return content.encode('utf-8')
-
-      def handler(event, context):
-        bucket = event.get('bucket') or os.environ.get('BUCKET_NAME')
-        table = event.get('table') or os.environ.get('TABLE_NAME')
-        today = dt.utcnow().date()
-        q = _quarter(today)
-        year = today.year
-        title = f"PR Review Quarterly Report {year} Q{q}"
-        # Minimal metrics (placeholder): count items via scan (bounded)
-        items = []
-        paginator = DDB.get_paginator('scan')
-        for page in paginator.paginate(TableName=table, PaginationConfig={'MaxItems': 500}):
-          items.extend(page.get('Items', []))
-        total = len(items)
-        lines = [
-          f"Total runs (sampled): {total}",
-          "Verdict mix: TBD (wire once schema is defined)",
-          "Failures: TBD",
-          "Median time saved: TBD",
-        ]
-        pdf = _pdf_bytes(title, lines)
-        key = f"reports/{year}-Q{q}.pdf"
-        S3.put_object(Bucket=bucket, Key=key, Body=pdf, ContentType='application/pdf')
-        return {"status":"ok","report_key": key}
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}quarterly_report.zip
       Environment:
         Variables:
           TABLE_NAME: !Ref TableName
           BUCKET_NAME: !Ref BucketName
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+
+  AgentInvokerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-agent-invoker
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: agent_invoker.handler
+      Timeout: 60
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}agent_invoker.zip
+      Environment:
+        Variables:
+          AGENT_ID: !ImportValue pr-agent:Id
+          AGENT_ALIAS_ID: !ImportValue pr-agent:Alias
+          TABLE_NAME: !Ref TableName
+          BUNDLE_HASH: !Ref BundleHash
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+
+  OpaGateFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-opa-gate
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: opa_gate.handler
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}opa_gate.zip
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+
+  BundleGuardFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-bundle-guard
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: bundle_guard.handler
+      Timeout: 10
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}bundle_guard.zip
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          BUNDLE_HASH: !Ref BundleHash
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+
+  GitHubChecksFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-github-checks
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: github_checks.handler
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}github_checks.zip
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BucketName
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+
+  GitHubAppTokenFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-github-app-token
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: github_app_token.handler
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}github_app_token.zip
+      Environment:
+        Variables:
+          GITHUB_APP_SECRET_ARN: !If [ HasGitHubApp, !Ref GitHubAppSecretArn, '' ]
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+
+  GitHubMergeFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-github-merge
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: github_merge.handler
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}github_merge.zip
+      Environment:
+        Variables:
+          GITHUB_APP_SECRET_ARN: !If [ HasGitHubApp, !Ref GitHubAppSecretArn, '' ]
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+
+  ConfigModeFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pr-config-mode
+      Role: !GetAtt ToolsExecutionRole.Arn
+      Runtime: python3.12
+      Handler: config_mode.handler
+      Timeout: 15
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: !Sub ${CodeS3Prefix}config_mode.zip
+      Environment:
+        Variables:
+          MODE_PARAM: pr-review/mode
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
 
   QuarterlyReportRule:
     Type: AWS::Events::Rule
@@ -244,8 +426,78 @@ Resources:
       SourceArn: !GetAtt QuarterlyReportRule.Arn
 
 
+  AgentInvokerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: pr-agent-invoker-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: pr-agent-invoker
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref SnsArn ]
+
+  OpaGateErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: pr-opa-gate-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: pr-opa-gate
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref SnsArn ]
+
+  GitHubChecksErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: pr-github-checks-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: pr-github-checks
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref SnsArn ]
+
+  GitHubMergeErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: pr-github-merge-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: pr-github-merge
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref SnsArn ]
+
 Conditions:
   HasTeams: !Not [ !Equals [ !Ref TeamsSecretArn, '' ] ]
+  HasGitHubApp: !Not [ !Equals [ !Ref GitHubAppSecretArn, '' ] ]
+  HasArtifactsPrefix: !Not [ !Equals [ !Ref ArtifactsPrefix, '' ] ]
 
 Outputs:
   ToolsExecutionRoleArn:
@@ -254,6 +506,45 @@ Outputs:
   TfPlanParserFnArn:
     Value: !GetAtt TfPlanParserFn.Arn
     Export: { Name: pr-compute:TfPlanParserFn }
+  IamLintFnArn:
+    Value: !GetAtt IamLintFn.Arn
+    Export: { Name: pr-compute:IamLintFn }
+  RiskScoreFnArn:
+    Value: !GetAtt RiskScoreFn.Arn
+    Export: { Name: pr-compute:RiskScoreFn }
+  ImpactMapFnArn:
+    Value: !GetAtt ImpactMapFn.Arn
+    Export: { Name: pr-compute:ImpactMapFn }
+  DriftCheckFnArn:
+    Value: !GetAtt DriftCheckFn.Arn
+    Export: { Name: pr-compute:DriftCheckFn }
+  GitHubCommenterFnArn:
+    Value: !GetAtt GitHubCommenterFn.Arn
+    Export: { Name: pr-compute:GitHubCommenterFn }
+  TeamsNotifierFnArn:
+    Value: !GetAtt TeamsNotifierFn.Arn
+    Export: { Name: pr-compute:TeamsNotifierFn }
   QuarterlyReportFnArn:
     Value: !GetAtt QuarterlyReportFn.Arn
     Export: { Name: pr-compute:QuarterlyReportFn }
+  AgentInvokerFnArn:
+    Value: !GetAtt AgentInvokerFn.Arn
+    Export: { Name: pr-compute:AgentInvokerFn }
+  OpaGateFnArn:
+    Value: !GetAtt OpaGateFn.Arn
+    Export: { Name: pr-compute:OpaGateFn }
+  GitHubChecksFnArn:
+    Value: !GetAtt GitHubChecksFn.Arn
+    Export: { Name: pr-compute:GitHubChecksFn }
+  BundleGuardFnArn:
+    Value: !GetAtt BundleGuardFn.Arn
+    Export: { Name: pr-compute:BundleGuardFn }
+  GitHubAppTokenFnArn:
+    Value: !GetAtt GitHubAppTokenFn.Arn
+    Export: { Name: pr-compute:GitHubAppTokenFn }
+  GitHubMergeFnArn:
+    Value: !GetAtt GitHubMergeFn.Arn
+    Export: { Name: pr-compute:GitHubMergeFn }
+  ConfigModeFnArn:
+    Value: !GetAtt ConfigModeFn.Arn
+    Export: { Name: pr-compute:ConfigModeFn }

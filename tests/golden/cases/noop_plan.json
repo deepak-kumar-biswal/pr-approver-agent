@@ -1,0 +1,6 @@
+{
+  "summary": {
+    "total_resources": 0,
+    "iam": { "wildcard_actions": [] }
+  }
+}

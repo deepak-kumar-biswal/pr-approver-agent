@@ -1,6 +1,7 @@
 import os
 import boto3
 from typing import Dict, Any, List
+from lambdas._log import log
 
 ASSUME_ROLE_NAME = os.environ.get("SPOKE_READONLY_ROLE", "CrossAccountReadOnlyRole")
 
@@ -40,11 +41,13 @@ def handler(event, context):
       - drift: none/suspect
       - details: mismatches by account/role
     """
+    log("INFO", "drift_check start", event)
     summary = (event or {}).get("summary", {})
     iam_sum = summary.get("iam", {})
     intended_roles = set(iam_sum.get("roles_affected") or [])
     accounts = event.get("spoke_accounts") or summary.get("accounts") or []
     if not accounts or not intended_roles:
+        log("INFO", "drift_check skip - no accounts or roles", event)
         return {"drift": "none", "reason": "no-accounts-or-roles"}
 
     mismatches = {}
@@ -64,7 +67,9 @@ def handler(event, context):
             if missing:
                 mismatches[acct] = details
         except Exception as e:
+            log("ERROR", "drift_check assume/list failed", event, account=acct, error=str(e))
             mismatches[acct] = {"error": str(e)}
 
     status = "none" if not mismatches else "suspect"
+    log("INFO", "drift_check done", event, status=status, accounts=len(accounts))
     return {"drift": status, "details": mismatches}
