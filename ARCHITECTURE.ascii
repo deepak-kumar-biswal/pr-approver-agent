@@ -1,22 +1,43 @@
 # ARCHITECTURE (ASCII)
 
-GitHub (develop merge)
-   │  OIDC → GitHubOIDCArtifactsRole
-   ▼
-GitHub Action: terraform plan → plan.json + metadata
-   │  S3 Put + EventBridge PutEvents
-   ▼
-┌───────────────────────── Hub Account ─────────────────────────┐
-│ EventBridge → Step Functions (PR-Review-Orchestrator)         │
-│  ├─ Lambda: OPA/Conftest Gate                                 │
-│  ├─ Lambda: TF Plan Parser → structured diffs                  │
-│  ├─ Lambda: IAM Lint (aws-iam-policy-validator + custom)      │
-│  ├─ Lambda: Risk Scorer                                       │
-│  ├─ Bedrock Agent (KB + Tools)                                │
-│  ├─ Lambda: Drift Check (assume CrossAccountReadOnlyRole)     │
-│  └─ Lambda: GitHub Commenter + (optional) Teams Notifier      │
-│  S3 (KMS), DynamoDB (audit), SNS                               │
-└───────────────────────────────────────────────────────────────┘
-                 │
-                 ▼
-        Spoke Accounts (read‑only via assume role)
+GitHub
+   ├─ Actions: deploy-compute.yml (OIDC → artifacts role)
+   │    ├─ Package Lambdas (incl. OPA WASM, GH App helpers, ReportLab)
+   │    ├─ Upload to S3 (artifacts)
+   │    ├─ Compute BundleHash (governance)
+   │    └─ Deploy CFN (Core/IAM/Compute/Agent/Orchestration)
+   └─ Actions: golden.yml (nightly regression suite)
+
+Runtime Trigger
+   GitHub → EventBridge (pr-merged) → Step Functions
+
+┌───────────────────────── Hub Account (PR Review) ─────────────────────────┐
+│ Core & Shared:                                                            │
+│  • S3 (Artifacts/Reports, KMS-encrypted)                                  │
+│  • DynamoDB (PRRuns audit), SQS DLQ                                       │
+│  • KMS CMK, SNS Topic                                                     │
+│  • Secrets Manager (Teams webhook, GitHub App key)                        │
+│  • SSM Parameter (pr-review/mode)                                         │
+│  • CloudWatch Dashboard & Alarms                                          │
+│                                                                            │
+│ Orchestration: EventBridge → Step Functions (pr-review-orchestrator)       │
+│  ├─ Lambda: TF Plan Parser → structured diffs (reads plan.json from S3)     │
+│  ├─ Lambda: Config Mode (reads SSM pr-review/mode)                          │
+│  ├─ Lambda: Bundle Guard (DDB CONFIG#BUNDLE#<hash> → require approval)      │
+│  ├─ Lambda: OPA Gate (WASM preferred; denies short-circuit)                 │
+│  ├─ Lambda: IAM Lint (policy validator + custom rules)                      │
+│  ├─ Lambda: Risk Scorer                                                     │
+│  ├─ Lambda: Drift Check (assume CrossAccountReadOnlyRole)                   │
+│  ├─ Lambda: Impact Map                                                      │
+│  ├─ Lambda: Agent Invoker → Bedrock Agent (KB + Tools)                      │
+│  ├─ Lambda: GitHub Checks (Check Run + metrics)                             │
+│  ├─ Choice: Approval Decide                                                 │
+│  │    ├─ suggest_approve → GitHub Commenter                                 │
+│  │    └─ auto_approve → GitHub Merge (GitHub App)                           │
+│  └─ Lambda: GitHub Commenter → Teams Notifier                               │
+│                                                                            │
+│ Notes: All Lambdas have DLQ; critical Lambdas have alarms.                  │
+└────────────────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+             Spoke Accounts (read‑only via assume role)
